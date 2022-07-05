@@ -3,16 +3,15 @@ pragma solidity >=0.6.11;
 
 // ============ Internal Imports ============
 import {AbacusConnectionClient} from "./AbacusConnectionClient.sol";
-import {IAbacusConnectionManager} from "@abacus-network/core/interfaces/IAbacusConnectionManager.sol";
-import {IInterchainGasPaymaster} from "@abacus-network/core/interfaces/IInterchainGasPaymaster.sol";
-import {IMessageRecipient} from "@abacus-network/core/interfaces/IMessageRecipient.sol";
-import {IOutbox} from "@abacus-network/core/interfaces/IOutbox.sol";
+import {IAbacusConnectionManager} from "../interfaces/IAbacusConnectionManager.sol";
+import {IInterchainGasPaymaster} from "../interfaces/IInterchainGasPaymaster.sol";
+import {IMessageRecipient} from "../interfaces/IMessageRecipient.sol";
+import {IOutbox} from "../interfaces/IOutbox.sol";
 
 abstract contract Router is AbacusConnectionClient, IMessageRecipient {
     // ============ Mutable Storage ============
 
     mapping(uint32 => bytes32) public routers;
-    uint256[49] private __GAP; // gap for upgrade safety
 
     // ============ Events ============
 

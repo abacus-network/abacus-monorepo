@@ -2,14 +2,14 @@
 pragma solidity >=0.6.11;
 
 // ============ Internal Imports ============
-import {IInterchainGasPaymaster} from "@abacus-network/core/interfaces/IInterchainGasPaymaster.sol";
-import {IOutbox} from "@abacus-network/core/interfaces/IOutbox.sol";
-import {IAbacusConnectionManager} from "@abacus-network/core/interfaces/IAbacusConnectionManager.sol";
+import {IInterchainGasPaymaster} from "../interfaces/IInterchainGasPaymaster.sol";
+import {IOutbox} from "../interfaces/IOutbox.sol";
+import {IAbacusConnectionManager} from "../interfaces/IAbacusConnectionManager.sol";
 
 // ============ External Imports ============
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-abstract contract AbacusConnectionClient is OwnableUpgradeable {
+abstract contract AbacusConnectionClient is Ownable {
     // ============ Mutable Storage ============
 
     IAbacusConnectionManager public abacusConnectionManager;
@@ -18,10 +18,7 @@ abstract contract AbacusConnectionClient is OwnableUpgradeable {
     // otherwise payments made to the paymaster will not result in relayed messages.
     IInterchainGasPaymaster public interchainGasPaymaster;
 
-    uint256[48] private __GAP; // gap for upgrade safety
-
     // ============ Events ============
-
     /**
      * @notice Emitted when a new abacusConnectionManager is set.
      * @param abacusConnectionManager The address of the abacusConnectionManager contract
@@ -44,13 +41,8 @@ abstract contract AbacusConnectionClient is OwnableUpgradeable {
         _;
     }
 
-    // ======== Initializer =========
-
-    function __AbacusConnectionClient_initialize(
-        address _abacusConnectionManager
-    ) internal onlyInitializing {
+    constructor(address _abacusConnectionManager) Ownable() {
         _setAbacusConnectionManager(_abacusConnectionManager);
-        __Ownable_init();
     }
 
     function __AbacusConnectionClient_initialize(
