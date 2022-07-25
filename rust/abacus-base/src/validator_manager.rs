@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use abacus_core::{
-    accumulator::merkle::Proof, AbacusMessage, ChainCommunicationError, InboxValidatorManager,
-    MultisigSignedCheckpoint, TxOutcome,
+    accumulator::merkle::Proof, AbacusMessage, Address, ChainCommunicationError,
+    InboxValidatorManager, MultisigSignedCheckpoint, TxOutcome,
 };
 
 #[derive(Debug, Clone)]
@@ -66,6 +66,18 @@ impl InboxValidatorManager for InboxValidatorManagerVariants {
                     .process(multisig_signed_checkpoint, message, proof)
                     .await
             }
+        }
+    }
+
+    fn contract_address(&self) -> Address {
+        match self {
+            InboxValidatorManagerVariants::Ethereum(validator_manager) => {
+                validator_manager.contract_address()
+            }
+            InboxValidatorManagerVariants::Mock(validator_manager) => {
+                validator_manager.contract_address()
+            }
+            InboxValidatorManagerVariants::Other(_) => unimplemented!(),
         }
     }
 }

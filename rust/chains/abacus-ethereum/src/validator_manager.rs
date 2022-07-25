@@ -14,11 +14,11 @@ use abacus_core::{
     Encode, InboxValidatorManager, MultisigSignedCheckpoint, TxOutcome,
 };
 
-use crate::contracts::inbox_validator_manager::{
-    InboxValidatorManager as EthereumInboxValidatorManagerInternal, INBOXVALIDATORMANAGER_ABI,
-};
+use crate::contracts::inbox_validator_manager::InboxValidatorManager as EthereumInboxValidatorManagerInternal;
 use crate::trait_builder::MakeableWithProvider;
 use crate::tx::report_tx;
+
+pub use crate::contracts::inbox_validator_manager::INBOXVALIDATORMANAGER_ABI;
 
 impl<M> Display for EthereumInboxValidatorManagerInternal<M>
 where
@@ -60,6 +60,7 @@ where
     domain: u32,
     #[allow(unused)]
     chain_name: String,
+    address: Address,
     #[allow(unused)]
     provider: Arc<M>,
     inbox_address: Address,
@@ -79,6 +80,7 @@ where
             )),
             domain: locator.domain,
             chain_name: locator.chain_name.to_owned(),
+            address: locator.address.clone().into(),
             provider,
             inbox_address,
         }
@@ -120,6 +122,10 @@ where
         let gassed = tx.gas(gas);
         let receipt = report_tx(gassed).await?;
         Ok(receipt.into())
+    }
+
+    fn contract_address(&self) -> abacus_core::Address {
+        self.address.into()
     }
 }
 

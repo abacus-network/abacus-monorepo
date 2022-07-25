@@ -1,98 +1,231 @@
-use abacus_base::{chains::GelatoConf, InboxContracts};
-use abacus_core::db::AbacusDB;
-use tokio::task::JoinHandle;
-
-use eyre::Result;
+use abacus_base::CoreMetrics;
+use abacus_core::{db::AbacusDB, Encode, Signers};
+use abacus_ethereum::validator_manager::INBOXVALIDATORMANAGER_ABI as ivm_abi;
+use ethers::abi::Token;
+use ethers::types::{Address, U256};
+use ethers_contract::BaseContract;
+use eyre::{bail, Result};
+use gelato::chains::Chain;
+use gelato::fwd_req_call::{ForwardRequestArgs, PaymentType, NATIVE_FEE_TOKEN_ADDRESS};
+use prometheus::{Histogram, IntCounter, IntGauge};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
+use tokio::{sync::mpsc::error::TryRecvError, task::JoinHandle};
 use tracing::{info_span, instrument::Instrumented, Instrument};
 
 use super::SubmitMessageArgs;
 
-// TODO(webbhorn): Metrics data.
-// TODO(webbhorn): Pull in ForwardRequestOp logic from prior branch.
+const DEFAULT_MAX_FEE: u32 = 1_000_000_000;
 
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct GelatoSubmitter {
     /// Source of messages to submit.
-    rx: mpsc::UnboundedReceiver<SubmitMessageArgs>,
-
-    /// Interface to Inbox / InboxValidatorManager on the destination chain.
-    /// Will be useful in retry logic to determine whether or not to re-submit
-    /// forward request to Gelato, if e.g. we have confirmation via inbox syncer
-    /// that the message has already been submitted by some other relayer.
-    inbox_contracts: InboxContracts,
-
+    pub messages: mpsc::UnboundedReceiver<SubmitMessageArgs>,
+    /// The Abacus domain of the source chain for messages to be submitted via this GelatoSubmitter.
+    pub outbox_domain: u32,
+    /// The Abacus domain of the destination chain for messages submitted with this GelatoSubmitter.
+    pub inbox_domain: u32,
+    /// The on-chain address of the inbox contract on the destination chain.
+    pub inbox_address: Address,
+    /// Address of the inbox validator manager contract that will be specified
+    /// to Gelato in ForwardRequest submissions to process new messages.
+    pub ivm_address: Address,
+    /// The address of the 'sponsor' contract providing payment to Gelato.
+    pub sponsor_address: Address,
     /// Interface to agent rocks DB for e.g. writing delivery status upon completion.
-    db: AbacusDB,
+    /// TODO(webbhorn): Promote to non-_-prefixed name once we're checking gas payments.
+    pub _db: AbacusDB,
+    /// Signer to use for EIP-712 meta-transaction signatures.
+    pub signer: Signers,
+    /// Shared reqwest HTTP client to use for any ops to Gelato endpoints.
+    /// Intended to be shared by reqwest library.
+    pub http: reqwest::Client,
+    /// Prometheus metrics.
+    /// TODO(webbhorn): Promote to non-_-prefixed name once we're populating metrics.
+    pub _metrics: GelatoSubmitterMetrics,
 }
 
 impl GelatoSubmitter {
-    pub fn new(
-        cfg: GelatoConf,
-        rx: mpsc::UnboundedReceiver<SubmitMessageArgs>,
-        inbox_contracts: InboxContracts,
-        db: AbacusDB,
-    ) -> Self {
-        assert!(cfg.enabled_for_message_submission);
-        Self {
-            rx,
-            inbox_contracts,
-            db,
-        }
-    }
-
     pub fn spawn(mut self) -> Instrumented<JoinHandle<Result<()>>> {
         tokio::spawn(async move { self.work_loop().await })
-            .instrument(info_span!("submitter work loop"))
+            .instrument(info_span!("gelato submitter work loop"))
     }
 
-    /// The Gelato relay framework allows us to submit ops in
-    /// parallel, subject to certain retry rules. Therefore all we do
-    /// here is spin forever asking for work from the rx channel, then
-    /// spawn the work to submit to gelato in a root tokio task.
-    ///
-    /// It is possible that there has not been sufficient interchain
-    /// gas deposited in the InterchainGasPaymaster account on the source
-    /// chain, so we also keep a wait queue of ops that we
-    /// periodically scan for any gas updates.
-    ///
-    /// In the future one could maybe imagine also applying a global
-    /// rate-limiter against the relevant Gelato HTTP endpoint or
-    /// something, or a max-inflight-cap on Gelato messages from
-    /// relayers, enforced here. But probably not until that proves to
-    /// be necessary.
     async fn work_loop(&mut self) -> Result<()> {
         loop {
             self.tick().await?;
-            tokio::task::yield_now().await;
+            sleep(Duration::from_millis(1000)).await;
         }
     }
 
-    /// Extracted from main loop to enable testing submitter state
-    /// after each tick, e.g. in response to a change in environment
-    /// conditions like values in InterchainGasPaymaster.
-    async fn tick(&self) -> Result<()> {
-        // TODO(webbhorn): Pull all available messages out of self.rx
-        // and check if enough gas to process them. If not, put on
-        // wait queue. If there is enough, spawn root task and run
-        // the fwd req op.
+    async fn tick(&mut self) -> Result<()> {
+        // Pull any messages sent by processor over channel.
+        loop {
+            match self.messages.try_recv() {
+                Ok(msg) => {
+                    let op = ForwardRequestOp {
+                        args: self.make_forward_request_args(msg)?,
+                        opts: ForwardRequestOptions::default(),
+                        signer: self.signer.clone(),
+                        http: self.http.clone(),
+                    };
+                    tokio::spawn(async move {
+                        op.run()
+                            .await
+                            .expect("failed unimplemented forward request submit op");
+                    });
+                }
+                Err(TryRecvError::Empty) => {
+                    break;
+                }
+                Err(_) => {
+                    bail!("Disconnected receive channel or fatal err");
+                }
+            }
+        }
+        Ok(())
+    }
 
-        // TODO(webbhorn): Scan pending queue for any newly-eligible
-        // ops and if encountered, spawn them in a root task.
-        // Remove them from pending queue if so.
+    fn make_forward_request_args(&self, msg: SubmitMessageArgs) -> Result<ForwardRequestArgs> {
+        let ivm_base_contract = BaseContract::from(ivm_abi.clone());
+        let call_data = ivm_base_contract.encode(
+            "process",
+            [
+                Token::Address(self.inbox_address),
+                Token::FixedBytes(msg.checkpoint.checkpoint.root.to_fixed_bytes().into()),
+                Token::Uint(msg.checkpoint.checkpoint.index.into()),
+                Token::Array(
+                    msg.checkpoint
+                        .signatures
+                        .iter()
+                        .map(|s| Token::Bytes(s.to_vec()))
+                        .collect(),
+                ),
+                Token::Bytes(msg.committed_message.message.to_vec()),
+                Token::FixedArray(
+                    msg.proof.path[0..32]
+                        .iter()
+                        .map(|e| Token::FixedBytes(e.to_vec()))
+                        .collect(),
+                ),
+                Token::Uint(msg.leaf_index.into()),
+            ],
+        )?;
+        Ok(ForwardRequestArgs {
+            chain_id: abacus_domain_to_gelato_chain(self.inbox_domain)?,
+            target: self.ivm_address,
+            data: call_data,
+            fee_token: NATIVE_FEE_TOKEN_ADDRESS,
+            payment_type: PaymentType::AsyncGasTank,
+            max_fee: DEFAULT_MAX_FEE.into(), // Maximum fee that sponsor is willing to pay.
+            gas: DEFAULT_MAX_FEE.into(),     // Gas limit.
+            sponsor_chain_id: abacus_domain_to_gelato_chain(self.outbox_domain)?,
+            nonce: U256::zero(),
+            enforce_sponsor_nonce: false,
+            enforce_sponsor_nonce_ordering: false,
+            sponsor: self.sponsor_address,
+        })
+    }
+}
 
-        // TODO(webbhorn): Either wait for finality in the ForwardRequestOp
-        // logic, or follow the pattern from serial_submitter.rs
-        // of implementing a verification queue, where we will stash
-        // successfully submitted ops that have not yet reached finality.
-        // Only after reaching finality will we commit the new status to
-        // AbacusDB and drop those messages from the verification queue.
-        // In case of a destination chain re-org, they would need
-        // to go back to the wait queue.
+// TODO(webbhorn): Is there already somewhere actually canonical/authoritative to use instead
+// of duplicating this here?  Perhaps we can expand `macro_rules! domain_and_chain`?
+// Otherwise, try to keep this translation logic out of the gelato crate at least so that we
+// don't start introducing any Abacus concepts (like domain) into it.
+fn abacus_domain_to_gelato_chain(domain: u32) -> Result<Chain> {
+    Ok(match domain {
+        6648936 => Chain::Mainnet,
+        1634872690 => Chain::Rinkeby,
+        3000 => Chain::Kovan,
+        1886350457 => Chain::Polygon,
+        80001 => Chain::PolygonMumbai,
+        1635148152 => Chain::Avalanche,
+        43113 => Chain::AvalancheFuji,
+        6386274 => Chain::Arbitrum,
+        28528 => Chain::Optimism,
+        1869622635 => Chain::OptimismKovan,
+        6452067 => Chain::BinanceSmartChain,
+        1651715444 => Chain::BinanceSmartChainTestnet,
+        // TODO(webbhorn): Uncomment once Gelato supports Celo.
+        // 1667591279 => Chain::Celo,
+        // TODO(webbhorn): Need Alfajores support too.
+        // TODO(webbhorn): What is the difference between ArbitrumRinkeby and ArbitrumTestnet?
+        // 421611 => Chain::ArbitrumTestnet,
+        // TODO(webbhorn): Abacus hasn't assigned a domain id for Alfajores yet.
+        // 5 => Chain::Goerli,
+        _ => bail!("Unknown domain {}", domain),
+    })
+}
+// TODO(webbhorn): Remove 'allow unused' once we impl run() and ref internal fields.
+#[allow(unused)]
+#[derive(Debug, Clone)]
+pub struct ForwardRequestOp<S> {
+    args: ForwardRequestArgs,
+    opts: ForwardRequestOptions,
+    signer: S,
+    http: reqwest::Client,
+}
 
-        // TODO(webbhorn): monitoring / metrics.
+impl<S> ForwardRequestOp<S> {
+    async fn run(&self) -> Result<()> {
+        todo!()
+    }
+}
 
-        unimplemented!()
+#[derive(Debug, Clone)]
+pub struct ForwardRequestOptions {
+    pub poll_interval: Duration,
+    pub retry_submit_interval: Duration,
+}
+
+impl Default for ForwardRequestOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(60),
+            retry_submit_interval: Duration::from_secs(20 * 60),
+        }
+    }
+}
+
+// TODO(webbhorn): Drop allow dead code directive once we handle
+// updating each of these metrics.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct GelatoSubmitterMetrics {
+    run_queue_length_gauge: IntGauge,
+    wait_queue_length_gauge: IntGauge,
+    queue_duration_hist: Histogram,
+    processed_gauge: IntGauge,
+    messages_processed_count: IntCounter,
+    /// Private state used to update actual metrics each tick.
+    max_submitted_leaf_index: u32,
+}
+
+impl GelatoSubmitterMetrics {
+    pub fn new(metrics: &CoreMetrics, outbox_chain: &str, inbox_chain: &str) -> Self {
+        Self {
+            run_queue_length_gauge: metrics.submitter_queue_length().with_label_values(&[
+                outbox_chain,
+                inbox_chain,
+                "run_queue",
+            ]),
+            wait_queue_length_gauge: metrics.submitter_queue_length().with_label_values(&[
+                outbox_chain,
+                inbox_chain,
+                "wait_queue",
+            ]),
+            queue_duration_hist: metrics
+                .submitter_queue_duration_histogram()
+                .with_label_values(&[outbox_chain, inbox_chain]),
+            messages_processed_count: metrics
+                .messages_processed_count()
+                .with_label_values(&[outbox_chain, inbox_chain]),
+            processed_gauge: metrics.last_known_message_leaf_index().with_label_values(&[
+                "message_processed",
+                outbox_chain,
+                inbox_chain,
+            ]),
+            max_submitted_leaf_index: 0,
+        }
     }
 }

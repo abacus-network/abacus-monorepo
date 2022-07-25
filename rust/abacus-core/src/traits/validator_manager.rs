@@ -6,7 +6,7 @@ use eyre::Result;
 use crate::{
     accumulator::merkle::Proof,
     traits::{ChainCommunicationError, TxOutcome},
-    AbacusMessage, MultisigSignedCheckpoint,
+    AbacusMessage, Address, MultisigSignedCheckpoint,
 };
 
 /// Interface for an InboxValidatorManager
@@ -19,4 +19,7 @@ pub trait InboxValidatorManager: Send + Sync + Debug {
         message: &AbacusMessage,
         proof: &Proof,
     ) -> Result<TxOutcome, ChainCommunicationError>;
+
+    /// The on-chain address of the inbox validator manager contract.
+    fn contract_address(&self) -> Address;
 }
